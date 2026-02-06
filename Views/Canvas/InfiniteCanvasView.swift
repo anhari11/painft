@@ -717,11 +717,21 @@ class InfiniteCanvasUIView: UIView {
         // Skip if line is invisible
         guard screenWidth > 0.01 && screenWidth.isFinite else { return }
 
-        // Quick visibility check - skip if all points are way off screen
+        // Quick visibility check — use bounding box of all points so we
+        // don't cull strokes whose segments cross the screen even when
+        // every individual vertex is off-screen (common when zoomed in).
         let margin = screenWidth + 50
         let visibleBounds = bounds.insetBy(dx: -margin, dy: -margin)
-        let hasVisiblePoint = screenPoints.contains { visibleBounds.contains($0) }
-        guard hasVisiblePoint else { return }
+        var minX = screenPoints[0].x, maxX = minX
+        var minY = screenPoints[0].y, maxY = minY
+        for p in screenPoints.dropFirst() {
+            if p.x < minX { minX = p.x }
+            if p.x > maxX { maxX = p.x }
+            if p.y < minY { minY = p.y }
+            if p.y > maxY { maxY = p.y }
+        }
+        let strokeBBox = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        guard visibleBounds.intersects(strokeBBox) else { return }
 
         // Handle eraser with blend mode
         if stroke.isEraser {
