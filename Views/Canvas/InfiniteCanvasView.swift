@@ -536,8 +536,8 @@ class InfiniteCanvasUIView: UIView {
             guard scaleRatio.isFinite && scaleRatio > 0 else { return }
 
             var newZoom = viewModel.zoom * scaleRatio
-            let minZoom: Double = 0.0625
-            let maxZoom: Double = 1.2e14
+            let minZoom: Double = 1e-6
+            let maxZoom: Double = 1e18
             newZoom = max(minZoom, min(maxZoom, newZoom))
             guard newZoom.isFinite && newZoom > 0 else { return }
 
@@ -789,6 +789,14 @@ class InfiniteCanvasUIView: UIView {
             ctx.setStrokeColor(red: stroke.red, green: stroke.green, blue: stroke.blue, alpha: stroke.alpha * stroke.opacity)
         }
 
+        // At extreme zoom, CG breaks with huge effective line widths in the CTM.
+        // Switch to screen-space rendering with a capped line width.
+        if screenWidth > 5000 {
+            drawStrokeScreenSpace(stroke, ox: ox, oy: oy, z: z, midX: midX, midY: midY, screenWidth: screenWidth, in: ctx)
+            ctx.setBlendMode(.normal)
+            return
+        }
+
         // Draw using CTM with origin-relative translation.
         // (originX - cameraX) is a moderate value; local points are small.
         // CG handles clipping internally, preserving correct line angles.
@@ -886,6 +894,64 @@ class InfiniteCanvasUIView: UIView {
                 ctx.fillEllipse(in: CGRect(x: x + offsetX - dotSize/2, y: y + offsetY - dotSize/2, width: dotSize, height: dotSize))
             }
         }
+    }
+
+    /// Renders a stroke in screen space with a capped line width.
+    /// Used at extreme zoom where the CTM scale would produce line widths
+    /// too large for Core Graphics, causing strokes to vanish.
+    private func drawStrokeScreenSpace(_ stroke: Stroke, ox: Double, oy: Double, z: Double, midX: Double, midY: Double, screenWidth: CGFloat, in ctx: CGContext) {
+        // Convert points to screen space
+        var screenPoints: [CGPoint] = []
+        screenPoints.reserveCapacity(stroke.points.count)
+        for p in stroke.points {
+            let sx = (Double(p.x) + ox) * z + midX
+            let sy = (Double(p.y) + oy) * z + midY
+            guard sx.isFinite && sy.isFinite else { return }
+            screenPoints.append(CGPoint(x: sx, y: sy))
+        }
+        guard screenPoints.count > 1 else { return }
+
+        // Clamp coordinates to prevent CG overflow with extreme values
+        let clampR: Double = 100000
+        let bw = Double(bounds.width)
+        let bh = Double(bounds.height)
+        let clamped = screenPoints.map { p -> CGPoint in
+            CGPoint(x: max(-clampR, min(bw + clampR, p.x)),
+                    y: max(-clampR, min(bh + clampR, p.y)))
+        }
+
+        // Cap line width for CG stability
+        let cappedWidth = min(screenWidth, 8000)
+
+        ctx.saveGState()
+        ctx.setLineWidth(cappedWidth)
+        ctx.setLineCap(stroke.toolType.lineCap)
+        ctx.setLineJoin(stroke.toolType.lineJoin)
+
+        if stroke.isDraft && !stroke.dashPattern.isEmpty {
+            ctx.setLineDash(phase: 0, lengths: stroke.dashPattern.map { $0 * CGFloat(z) })
+        } else {
+            ctx.setLineDash(phase: 0, lengths: [])
+        }
+
+        ctx.beginPath()
+        ctx.move(to: clamped[0])
+
+        if stroke.toolType == .ruler || clamped.count == 2 {
+            ctx.addLine(to: clamped.last!)
+        } else {
+            for i in 1..<clamped.count {
+                let p0 = clamped[i - 1]
+                let p1 = clamped[i]
+                let mid = CGPoint(x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2)
+                if i == 1 { ctx.addLine(to: mid) }
+                else { ctx.addQuadCurve(to: mid, control: p0) }
+            }
+            ctx.addLine(to: clamped.last!)
+        }
+
+        ctx.strokePath()
+        ctx.restoreGState()
     }
 
     private func drawGrid(_ ctx: CGContext) {
