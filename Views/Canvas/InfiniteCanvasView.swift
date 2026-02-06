@@ -536,8 +536,8 @@ class InfiniteCanvasUIView: UIView {
             guard scaleRatio.isFinite && scaleRatio > 0 else { return }
 
             var newZoom = viewModel.zoom * scaleRatio
-            let minZoom: Double = 1.0
-            let maxZoom: Double = 1e30
+            let minZoom: Double = 0.0625
+            let maxZoom: Double = 1.2e14
             newZoom = max(minZoom, min(maxZoom, newZoom))
             guard newZoom.isFinite && newZoom > 0 else { return }
 
