@@ -226,6 +226,7 @@ class InfiniteCanvasUIView: UIView {
     private var currentPoints: [CGPoint] = []
     private var isDrawing = false
     private var isTwoFingerGesture = false
+    private var pinchOccurredDuringGesture = false
     private var lastDisplayTime: CFTimeInterval = 0
 
     // PencilKit tool picker (UI only — rendering is custom)
@@ -246,12 +247,9 @@ class InfiniteCanvasUIView: UIView {
     private var cacheCameraY: Double = 0
     private var cachedStrokeCount: Int = 0
 
-    // Pinch state
-    private var pinchStartZoom: Double = 1.0
-    private var pinchStartCameraX: Double = 0
-    private var pinchStartCameraY: Double = 0
-    private var pinchAnchorScreen: CGPoint = .zero
-    private var pinchAnchorWorld: CGPoint = .zero
+    // Pinch state (incremental)
+    private var pinchPrevCenter: CGPoint = .zero
+    private var pinchPrevScale: Double = 1.0
 
     // Pan state
     private var panStartCameraX: Double = 0
@@ -479,50 +477,57 @@ class InfiniteCanvasUIView: UIView {
         switch g.state {
         case .began:
             isTwoFingerGesture = true
+            pinchOccurredDuringGesture = true
             isDrawing = false
             viewModel.currentStroke = nil
             currentPoints = []
 
-            pinchStartZoom = viewModel.zoom
-            pinchStartCameraX = viewModel.cameraX
-            pinchStartCameraY = viewModel.cameraY
-
-            // Store initial anchor in both screen and world space
-            pinchAnchorScreen = g.location(in: self)
-            pinchAnchorWorld = screenToWorld(pinchAnchorScreen)
+            pinchPrevCenter = g.location(in: self)
+            pinchPrevScale = 1.0
 
         case .changed:
+            guard g.numberOfTouches >= 2 else { return }
+
             let scale = Double(g.scale)
             guard scale.isFinite && scale > 0 else { return }
 
-            var newZoom = pinchStartZoom * scale
-
-            // Practical limits to prevent Double precision issues
-            newZoom = max(1e-15, min(1e15, newZoom))
-
-            guard newZoom.isFinite && newZoom > 0 else { return }
-
-            // Calculate where the anchor point would appear with new zoom (from start camera)
-            let cx = Double(bounds.midX)
-            let cy = Double(bounds.midY)
-
-            // Get current gesture center
             let currentCenter = g.location(in: self)
 
-            // Calculate new camera so that the world anchor appears at current gesture center
-            let newCameraX = pinchAnchorWorld.x - (Double(currentCenter.x) - cx) / newZoom
-            let newCameraY = pinchAnchorWorld.y - (Double(currentCenter.y) - cy) / newZoom
+            // Incremental scale ratio since last frame
+            let scaleRatio = scale / pinchPrevScale
+            guard scaleRatio.isFinite && scaleRatio > 0 else { return }
 
-            // Only update if values are finite
+            var newZoom = viewModel.zoom * scaleRatio
+            newZoom = max(1e-15, min(1e15, newZoom))
+            guard newZoom.isFinite && newZoom > 0 else { return }
+
+            // The world point under the gesture center before this frame
+            let cx = Double(bounds.midX)
+            let cy = Double(bounds.midY)
+            let anchorWorldX = (Double(currentCenter.x) - cx) / viewModel.zoom + viewModel.cameraX
+            let anchorWorldY = (Double(currentCenter.y) - cy) / viewModel.zoom + viewModel.cameraY
+
+            // Adjust camera so the same world point stays under the gesture center at new zoom
+            let newCameraX = anchorWorldX - (Double(currentCenter.x) - cx) / newZoom
+            let newCameraY = anchorWorldY - (Double(currentCenter.y) - cy) / newZoom
+
             guard newCameraX.isFinite && newCameraY.isFinite else { return }
 
             viewModel.zoom = newZoom
             viewModel.cameraX = newCameraX
             viewModel.cameraY = newCameraY
 
+            // Also apply the pan delta (fingers moved as a group)
+            let dx = Double(currentCenter.x - pinchPrevCenter.x)
+            let dy = Double(currentCenter.y - pinchPrevCenter.y)
+            viewModel.cameraX -= dx / newZoom
+            viewModel.cameraY -= dy / newZoom
+
+            pinchPrevCenter = currentCenter
+            pinchPrevScale = scale
+
             onZoomChanged?(newZoom)
 
-            // Throttle redraws to ~30fps during gestures to prevent memory pressure
             let now = CACurrentMediaTime()
             if now - lastDisplayTime > 0.033 {
                 lastDisplayTime = now
@@ -551,6 +556,11 @@ class InfiniteCanvasUIView: UIView {
             panStartCameraY = viewModel.cameraY
 
         case .changed:
+            // Once a pinch has been detected during this gesture cycle,
+            // suppress all pan updates — the pinch handler already handles
+            // both zoom and pan. This prevents the jump when fingers lift.
+            if pinchOccurredDuringGesture { return }
+
             let t = g.translation(in: self)
             viewModel.cameraX = panStartCameraX - Double(t.x) / viewModel.zoom
             viewModel.cameraY = panStartCameraY - Double(t.y) / viewModel.zoom
@@ -563,6 +573,7 @@ class InfiniteCanvasUIView: UIView {
             }
 
         case .ended, .cancelled:
+            pinchOccurredDuringGesture = false
             isTwoFingerGesture = false
             setNeedsDisplay()
 
