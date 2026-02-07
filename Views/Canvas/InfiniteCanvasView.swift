@@ -27,8 +27,13 @@ private struct StableRNG: RandomNumberGenerator {
 
 struct Stroke {
     let id = UUID()
-    var points: [CGPoint]
+    var points: [CGPoint]       // stored as LOCAL offsets from (originX, originY)
     var lineWidth: CGFloat
+
+    // Local origin — camera position when the stroke was created.
+    // Points are stored relative to this so precision is preserved at any zoom.
+    let originX: Double
+    let originY: Double
 
     // Store color as concrete RGBA values to avoid dynamic color issues
     let red: CGFloat
@@ -43,9 +48,13 @@ struct Stroke {
     let dashPattern: [CGFloat]
     let isEraser: Bool
 
-    init(points: [CGPoint], color: UIColor, lineWidth: CGFloat, toolType: DrawingToolType = .pen, opacity: CGFloat = 1.0, draftMode: DraftMode = .off) {
+    init(points: [CGPoint], color: UIColor, lineWidth: CGFloat,
+         originX: Double = 0, originY: Double = 0,
+         toolType: DrawingToolType = .pen, opacity: CGFloat = 1.0, draftMode: DraftMode = .off) {
         self.points = points
         self.lineWidth = lineWidth
+        self.originX = originX
+        self.originY = originY
         self.toolType = toolType
         self.opacity = opacity * toolType.defaultOpacity * draftMode.opacity
         self.isDraft = draftMode != .off
@@ -86,10 +95,31 @@ class InfiniteCanvasViewModel: ObservableObject {
     @Published var strokes: [Stroke] = []
     @Published var currentStroke: Stroke?
 
-    // Camera state - using Double for precision at extreme zoom
-    var cameraX: Double = 0
-    var cameraY: Double = 0
+    // Camera state — compound representation for precision at extreme zoom.
+    // The effective camera position is (cameraBaseX + cameraFineX).
+    // "base" is a coarse anchor, "fine" accumulates small deltas precisely.
+    // This avoids losing sub-Double-epsilon offsets when zoom is huge.
+    var cameraBaseX: Double = 0
+    var cameraBaseY: Double = 0
+    var cameraFineX: Double = 0
+    var cameraFineY: Double = 0
     var zoom: Double = 1.0
+
+    var cameraX: Double {
+        get { cameraBaseX + cameraFineX }
+        set { cameraBaseX = newValue; cameraFineX = 0 }
+    }
+    var cameraY: Double {
+        get { cameraBaseY + cameraFineY }
+        set { cameraBaseY = newValue; cameraFineY = 0 }
+    }
+
+    /// Fold fine into base. Safe to call at low-to-moderate zoom
+    /// where the precision loss is negligible.
+    func reanchorCamera() {
+        cameraBaseX += cameraFineX; cameraFineX = 0
+        cameraBaseY += cameraFineY; cameraFineY = 0
+    }
 
     // Tool settings
     @Published var currentColor: UIColor = .black
@@ -223,7 +253,9 @@ class InfiniteCanvasUIView: UIView {
     var viewModel: InfiniteCanvasViewModel!
     var onZoomChanged: ((Double) -> Void)?
 
-    private var currentPoints: [CGPoint] = []
+    private var currentPoints: [CGPoint] = []    // local-space points
+    private var currentOriginX: Double = 0
+    private var currentOriginY: Double = 0
     private var isDrawing = false
     private var isTwoFingerGesture = false
     private var pinchOccurredDuringGesture = false
@@ -243,8 +275,10 @@ class InfiniteCanvasUIView: UIView {
     // Cache for completed strokes
     private var strokeCache: UIImage?
     private var cacheZoom: Double = 0
-    private var cacheCameraX: Double = 0
-    private var cacheCameraY: Double = 0
+    private var cacheCameraBaseX: Double = 0
+    private var cacheCameraBaseY: Double = 0
+    private var cacheCameraFineX: Double = 0
+    private var cacheCameraFineY: Double = 0
     private var cachedStrokeCount: Int = 0
 
     // Pinch state (incremental)
@@ -360,14 +394,19 @@ class InfiniteCanvasUIView: UIView {
 
         isDrawing = true
         let screen = touch.location(in: self)
-        let world = screenToWorld(screen)
+
+        // Lock the origin to the camera BASE so local offsets include
+        // the fine component and stay precise at extreme zoom.
+        currentOriginX = viewModel.cameraBaseX
+        currentOriginY = viewModel.cameraBaseY
+        let local = screenToLocal(screen, originX: currentOriginX, originY: currentOriginY)
 
         let worldLineWidth = viewModel.currentLineWidth / CGFloat(viewModel.zoom)
-        currentPoints = [world]
+        currentPoints = [local]
 
         // Handle ruler tool
         if viewModel.currentTool == .ruler {
-            viewModel.rulerGuide = RulerGuide(startPoint: world, endPoint: world, isActive: true)
+            viewModel.rulerGuide = RulerGuide(startPoint: local, endPoint: local, isActive: true)
             viewModel.isRulerActive = true
         }
 
@@ -375,6 +414,8 @@ class InfiniteCanvasUIView: UIView {
             points: currentPoints,
             color: viewModel.currentTool == .eraser ? .white : viewModel.currentColor,
             lineWidth: worldLineWidth,
+            originX: currentOriginX,
+            originY: currentOriginY,
             toolType: viewModel.currentTool,
             opacity: viewModel.currentOpacity,
             draftMode: viewModel.draftMode
@@ -386,11 +427,11 @@ class InfiniteCanvasUIView: UIView {
         guard isDrawing, touches.count == 1, let touch = touches.first else { return }
 
         let screen = touch.location(in: self)
-        let world = screenToWorld(screen)
+        let local = screenToLocal(screen, originX: currentOriginX, originY: currentOriginY)
 
         // Handle ruler tool - only track start and end
         if viewModel.currentTool == .ruler {
-            viewModel.rulerGuide?.endPoint = world
+            viewModel.rulerGuide?.endPoint = local
             let guide = viewModel.rulerGuide!
             let endPoint = viewModel.snapToAngles ? guide.snappedEndPoint() : guide.endPoint
             currentPoints = [guide.startPoint, endPoint]
@@ -401,10 +442,10 @@ class InfiniteCanvasUIView: UIView {
 
         // Add point with minimum screen distance of 4 pixels
         if let last = currentPoints.last {
-            let lastScreen = worldToScreen(last)
+            let lastScreen = localToScreen(last, originX: currentOriginX, originY: currentOriginY)
             let screenDist = hypot(screen.x - lastScreen.x, screen.y - lastScreen.y)
             if screenDist > 4 {
-                currentPoints.append(world)
+                currentPoints.append(local)
                 viewModel.currentStroke?.points = currentPoints
 
                 // Throttle redraws to 50fps
@@ -463,12 +504,38 @@ class InfiniteCanvasUIView: UIView {
         return CGPoint(x: x, y: y)
     }
 
+    /// Convert screen position to a local offset relative to a given origin.
+    /// Uses compound camera (base+fine) so precision is preserved at any zoom.
+    /// When originX == cameraBaseX, the result is (screen/zoom + cameraFine),
+    /// keeping all terms small.
+    func screenToLocal(_ screen: CGPoint, originX: Double, originY: Double) -> CGPoint {
+        let cx = Double(bounds.midX)
+        let cy = Double(bounds.midY)
+        guard viewModel.zoom > 0 else { return .zero }
+        // Split: (cameraBase - origin) is small when origin==base; cameraFine is small.
+        let x = (Double(screen.x) - cx) / viewModel.zoom + (viewModel.cameraBaseX - originX) + viewModel.cameraFineX
+        let y = (Double(screen.y) - cy) / viewModel.zoom + (viewModel.cameraBaseY - originY) + viewModel.cameraFineY
+        return CGPoint(x: x, y: y)
+    }
+
     func worldToScreen(_ world: CGPoint) -> CGPoint {
         let cx = Double(bounds.midX)
         let cy = Double(bounds.midY)
         let x = (Double(world.x) - viewModel.cameraX) * viewModel.zoom + cx
         let y = (Double(world.y) - viewModel.cameraY) * viewModel.zoom + cy
         return CGPoint(x: x, y: y)
+    }
+
+    /// Convert a local-origin point to screen coordinates.
+    /// Uses compound camera to keep intermediate values small at extreme zoom.
+    func localToScreen(_ local: CGPoint, originX: Double, originY: Double) -> CGPoint {
+        let cx = Double(bounds.midX)
+        let cy = Double(bounds.midY)
+        // Split the subtraction: (origin - cameraBase) is small for nearby strokes,
+        // cameraFine is always small, local is always small.
+        let dx = Double(local.x) + (originX - viewModel.cameraBaseX) - viewModel.cameraFineX
+        let dy = Double(local.y) + (originY - viewModel.cameraBaseY) - viewModel.cameraFineY
+        return CGPoint(x: dx * viewModel.zoom + cx, y: dy * viewModel.zoom + cy)
     }
 
     // MARK: - Pinch Zoom
@@ -498,30 +565,36 @@ class InfiniteCanvasUIView: UIView {
             guard scaleRatio.isFinite && scaleRatio > 0 else { return }
 
             var newZoom = viewModel.zoom * scaleRatio
-            newZoom = max(1e-15, min(1e15, newZoom))
+            newZoom = max(1.0, min(1e30, newZoom))
             guard newZoom.isFinite && newZoom > 0 else { return }
 
-            // The world point under the gesture center before this frame
+            // ── Precision-safe anchor zoom ──
+            // Instead of computing the absolute anchor world coordinate
+            // (which loses precision at extreme zoom), compute the camera
+            // DELTA directly.  Derivation:
+            //   delta = (S - C) * (1/oldZoom - 1/newZoom)
+            //         = (S - C) * (r - 1) / newZoom
+            // All terms are moderate-sized, so the delta is precise even
+            // when the absolute camera position is huge.
             let cx = Double(bounds.midX)
             let cy = Double(bounds.midY)
-            let anchorWorldX = (Double(currentCenter.x) - cx) / viewModel.zoom + viewModel.cameraX
-            let anchorWorldY = (Double(currentCenter.y) - cy) / viewModel.zoom + viewModel.cameraY
+            let screenOffX = Double(currentCenter.x) - cx
+            let screenOffY = Double(currentCenter.y) - cy
+            let zoomFactor = (scaleRatio - 1.0) / (scaleRatio) // = (r-1)/r, equivalent to (1/old - 1/new)*old
+            let anchorDeltaX = screenOffX / viewModel.zoom * zoomFactor
+            let anchorDeltaY = screenOffY / viewModel.zoom * zoomFactor
 
-            // Adjust camera so the same world point stays under the gesture center at new zoom
-            let newCameraX = anchorWorldX - (Double(currentCenter.x) - cx) / newZoom
-            let newCameraY = anchorWorldY - (Double(currentCenter.y) - cy) / newZoom
+            guard anchorDeltaX.isFinite && anchorDeltaY.isFinite else { return }
 
-            guard newCameraX.isFinite && newCameraY.isFinite else { return }
+            // Pan delta (fingers moved as a group)
+            let panDx = Double(currentCenter.x - pinchPrevCenter.x) / newZoom
+            let panDy = Double(currentCenter.y - pinchPrevCenter.y) / newZoom
 
+            // Apply all deltas to the fine component — never touches base,
+            // so precision is preserved at any zoom level.
+            viewModel.cameraFineX += anchorDeltaX - panDx
+            viewModel.cameraFineY += anchorDeltaY - panDy
             viewModel.zoom = newZoom
-            viewModel.cameraX = newCameraX
-            viewModel.cameraY = newCameraY
-
-            // Also apply the pan delta (fingers moved as a group)
-            let dx = Double(currentCenter.x - pinchPrevCenter.x)
-            let dy = Double(currentCenter.y - pinchPrevCenter.y)
-            viewModel.cameraX -= dx / newZoom
-            viewModel.cameraY -= dy / newZoom
 
             pinchPrevCenter = currentCenter
             pinchPrevScale = scale
@@ -552,8 +625,8 @@ class InfiniteCanvasUIView: UIView {
             viewModel.currentStroke = nil
             currentPoints = []
 
-            panStartCameraX = viewModel.cameraX
-            panStartCameraY = viewModel.cameraY
+            panStartCameraX = viewModel.cameraFineX
+            panStartCameraY = viewModel.cameraFineY
 
         case .changed:
             // Once a pinch has been detected during this gesture cycle,
@@ -562,8 +635,9 @@ class InfiniteCanvasUIView: UIView {
             if pinchOccurredDuringGesture { return }
 
             let t = g.translation(in: self)
-            viewModel.cameraX = panStartCameraX - Double(t.x) / viewModel.zoom
-            viewModel.cameraY = panStartCameraY - Double(t.y) / viewModel.zoom
+            // Apply pan delta to fine component — keeps precision at extreme zoom
+            viewModel.cameraFineX = panStartCameraX - Double(t.x) / viewModel.zoom
+            viewModel.cameraFineY = panStartCameraY - Double(t.y) / viewModel.zoom
 
             // Throttle redraws to ~30fps during gestures
             let now = CACurrentMediaTime()
@@ -617,8 +691,10 @@ class InfiniteCanvasUIView: UIView {
         // Check if we need to rebuild stroke cache
         let needsCache = strokeCache == nil ||
             cacheZoom != viewModel.zoom ||
-            cacheCameraX != viewModel.cameraX ||
-            cacheCameraY != viewModel.cameraY ||
+            cacheCameraBaseX != viewModel.cameraBaseX ||
+            cacheCameraBaseY != viewModel.cameraBaseY ||
+            cacheCameraFineX != viewModel.cameraFineX ||
+            cacheCameraFineY != viewModel.cameraFineY ||
             cachedStrokeCount != viewModel.strokes.count
 
         if needsCache {
@@ -642,9 +718,9 @@ class InfiniteCanvasUIView: UIView {
     }
 
     private func drawRulerGuide(_ guide: RulerGuide, in ctx: CGContext) {
-        let startScreen = worldToScreen(guide.startPoint)
+        let startScreen = localToScreen(guide.startPoint, originX: currentOriginX, originY: currentOriginY)
         let endPoint = viewModel.snapToAngles ? guide.snappedEndPoint() : guide.endPoint
-        let endScreen = worldToScreen(endPoint)
+        let endScreen = localToScreen(endPoint, originX: currentOriginX, originY: currentOriginY)
 
         // Draw guide line
         ctx.setStrokeColor(UIColor.systemBlue.withAlphaComponent(0.5).cgColor)
@@ -699,15 +775,17 @@ class InfiniteCanvasUIView: UIView {
             }
         }
         cacheZoom = viewModel.zoom
-        cacheCameraX = viewModel.cameraX
-        cacheCameraY = viewModel.cameraY
+        cacheCameraBaseX = viewModel.cameraBaseX
+        cacheCameraBaseY = viewModel.cameraBaseY
+        cacheCameraFineX = viewModel.cameraFineX
+        cacheCameraFineY = viewModel.cameraFineY
         cachedStrokeCount = viewModel.strokes.count
     }
 
     private func drawStroke(_ stroke: Stroke, in ctx: CGContext) {
         guard stroke.points.count > 1 else { return }
 
-        let screenPoints = stroke.points.map { worldToScreen($0) }
+        let screenPoints = stroke.points.map { localToScreen($0, originX: stroke.originX, originY: stroke.originY) }
 
         // Skip if any point is non-finite
         guard screenPoints.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return }
