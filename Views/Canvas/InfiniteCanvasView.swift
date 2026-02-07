@@ -216,9 +216,20 @@ class InfiniteCanvasViewModel: ObservableObject {
     }
 
     /// Fold fine deltas into base. Call when gestures end.
+    /// Skips the fold when the Double rounding error would cause a visible
+    /// screen-space shift (> 0.5 px). At extreme zoom with a large base,
+    /// `base + fine` can lose the fine bits entirely, so we leave fine
+    /// untouched in that case — it stays small naturally at high zoom
+    /// because gesture deltas are divided by zoom.
     func foldCamera() {
-        cameraBaseX += cameraFineX
-        cameraBaseY += cameraFineY
+        let newBaseX = cameraBaseX + cameraFineX
+        let newBaseY = cameraBaseY + cameraFineY
+        let errX = newBaseX.ulp   // smallest representable change at newBaseX
+        let errY = newBaseY.ulp
+        let maxScreenErr = max(errX, errY) * zoom
+        guard maxScreenErr < 0.5 else { return }
+        cameraBaseX = newBaseX
+        cameraBaseY = newBaseY
         cameraFineX = 0
         cameraFineY = 0
     }
@@ -400,9 +411,12 @@ class InfiniteCanvasUIView: UIView {
         isDrawing = true
         let screen = touch.location(in: self)
 
-        // Set stroke origin to current camera base for precision
-        currentStrokeOriginX = viewModel.cameraBaseX
-        currentStrokeOriginY = viewModel.cameraBaseY
+        // Set stroke origin to FULL camera position (base+fine).
+        // This keeps local coords = (screen-cx)/zoom — always tiny.
+        // Using base-only would mix the accumulated `fine` into local coords,
+        // and at extreme zoom the cancellation local−fine loses precision.
+        currentStrokeOriginX = viewModel.cameraBaseX + viewModel.cameraFineX
+        currentStrokeOriginY = viewModel.cameraBaseY + viewModel.cameraFineY
 
         let local = screenToLocal(screen, originX: currentStrokeOriginX, originY: currentStrokeOriginY)
         let worldLineWidth = viewModel.currentLineWidth / CGFloat(viewModel.zoom)
@@ -576,6 +590,11 @@ class InfiniteCanvasUIView: UIView {
             viewModel.cameraFineX -= dx / newZoom
             viewModel.cameraFineY -= dy / newZoom
 
+            // Fold every frame to keep fine small.  At low zoom during the
+            // gesture the fold succeeds, so by the time zoom is extreme fine
+            // is near zero and subsequent tiny deltas stay representable.
+            viewModel.foldCamera()
+
             pinchPrevCenter = currentCenter
             pinchPrevScale = scale
 
@@ -620,6 +639,8 @@ class InfiniteCanvasUIView: UIView {
             viewModel.cameraFineX -= dx / viewModel.zoom
             viewModel.cameraFineY -= dy / viewModel.zoom
             panPrevTranslation = t
+
+            viewModel.foldCamera()
 
             // Throttle redraws to ~30fps during gestures
             let now = CACurrentMediaTime()
@@ -773,33 +794,54 @@ class InfiniteCanvasUIView: UIView {
     private func drawStroke(_ stroke: Stroke, in ctx: CGContext) {
         guard stroke.points.count > 1 else { return }
 
-        let screenPoints = stroke.points.map { localToScreen($0, originX: stroke.originX, originY: stroke.originY) }
-
-        // Skip if any point is non-finite
-        guard screenPoints.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return }
-
         let screenWidth = CGFloat(Double(stroke.lineWidth) * viewModel.zoom)
-
-        // Skip if line is invisible
         guard screenWidth > 0.01 && screenWidth.isFinite else { return }
+        let safeWidth = min(screenWidth, CGFloat(30000))
 
-        // Quick visibility check — use bounding box of all points so we
-        // don't cull strokes whose segments cross the screen even when
-        // every individual vertex is off-screen (common when zoomed in).
-        let margin = screenWidth + 50
-        let visibleBounds = bounds.insetBy(dx: -margin, dy: -margin)
-        var minX = screenPoints[0].x, maxX = minX
-        var minY = screenPoints[0].y, maxY = minY
-        for p in screenPoints.dropFirst() {
-            if p.x < minX { minX = p.x }
-            if p.x > maxX { maxX = p.x }
-            if p.y < minY { minY = p.y }
-            if p.y > maxY { maxY = p.y }
+        // ── Visibility check ──
+        // Compute the world-space offset from stroke origin to current camera,
+        // then check if the stroke's local bounding box is on screen.
+        let offsetX = (stroke.originX - viewModel.cameraBaseX) - viewModel.cameraFineX
+        let offsetY = (stroke.originY - viewModel.cameraBaseY) - viewModel.cameraFineY
+        guard offsetX.isFinite && offsetY.isFinite else { return }
+
+        // Bounding box of local points
+        var lMinX = stroke.points[0].x, lMaxX = lMinX
+        var lMinY = stroke.points[0].y, lMaxY = lMinY
+        for p in stroke.points.dropFirst() {
+            if p.x < lMinX { lMinX = p.x }
+            if p.x > lMaxX { lMaxX = p.x }
+            if p.y < lMinY { lMinY = p.y }
+            if p.y > lMaxY { lMaxY = p.y }
         }
-        let strokeBBox = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        // Convert local bbox corners to screen
+        let cx = bounds.midX, cy = bounds.midY
+        let z = CGFloat(viewModel.zoom)
+        let ox = CGFloat(offsetX), oy = CGFloat(offsetY)
+        let sMinX = (CGFloat(lMinX) + ox) * z + cx
+        let sMaxX = (CGFloat(lMaxX) + ox) * z + cx
+        let sMinY = (CGFloat(lMinY) + oy) * z + cy
+        let sMaxY = (CGFloat(lMaxY) + oy) * z + cy
+        guard sMinX.isFinite && sMaxX.isFinite && sMinY.isFinite && sMaxY.isFinite else { return }
+
+        let margin = safeWidth + 50
+        let visibleBounds = bounds.insetBy(dx: -margin, dy: -margin)
+        let strokeBBox = CGRect(x: sMinX, y: sMinY, width: sMaxX - sMinX, height: sMaxY - sMinY)
         guard visibleBounds.intersects(strokeBBox) else { return }
 
-        // Handle eraser with blend mode
+        // ── Draw using CGContext transform (CTM) ──
+        // Instead of pre-multiplying coordinates by zoom (which produces huge
+        // Float32-breaking values), we set up a transform and draw in local
+        // coordinates.  CG clips paths through the CTM pipeline before
+        // rasterizing, so Float32 precision only matters for on-screen pixels.
+        ctx.saveGState()
+
+        // Transform: screen = (local + offset) * zoom + center
+        ctx.translateBy(x: cx, y: cy)
+        ctx.scaleBy(x: z, y: z)
+        ctx.translateBy(x: ox, y: oy)
+
+        // Colors and state (set AFTER saveGState)
         if stroke.isEraser {
             ctx.setBlendMode(.clear)
             ctx.setStrokeColor(UIColor.white.cgColor)
@@ -808,48 +850,50 @@ class InfiniteCanvasUIView: UIView {
             ctx.setStrokeColor(red: stroke.red, green: stroke.green, blue: stroke.blue, alpha: stroke.alpha * stroke.opacity)
         }
 
-        ctx.setLineWidth(screenWidth)
+        // Line width in world space — the CTM scales it to screen
+        ctx.setLineWidth(stroke.lineWidth)
         ctx.setLineCap(stroke.toolType.lineCap)
         ctx.setLineJoin(stroke.toolType.lineJoin)
 
-        // Apply dash pattern for draft mode
         if stroke.isDraft && !stroke.dashPattern.isEmpty {
-            let scaledDash = stroke.dashPattern.map { $0 * CGFloat(viewModel.zoom) }
-            ctx.setLineDash(phase: 0, lengths: scaledDash)
+            ctx.setLineDash(phase: 0, lengths: stroke.dashPattern)
         } else {
             ctx.setLineDash(phase: 0, lengths: [])
         }
 
+        // Build path in local coordinates (tiny numbers — always precise)
         ctx.beginPath()
-        ctx.move(to: screenPoints[0])
+        ctx.move(to: stroke.points[0])
 
-        // For ruler or 2-point strokes, draw straight line
-        if stroke.toolType == .ruler || screenPoints.count == 2 {
-            ctx.addLine(to: screenPoints.last!)
+        if stroke.toolType == .ruler || stroke.points.count == 2 {
+            ctx.addLine(to: stroke.points.last!)
         } else {
-            // Smooth curve for freehand tools
-            for i in 1..<screenPoints.count {
-                let p0 = screenPoints[i - 1]
-                let p1 = screenPoints[i]
+            for i in 1..<stroke.points.count {
+                let p0 = stroke.points[i - 1]
+                let p1 = stroke.points[i]
                 let mid = CGPoint(x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2)
-
                 if i == 1 {
                     ctx.addLine(to: mid)
                 } else {
                     ctx.addQuadCurve(to: mid, control: p0)
                 }
             }
-            ctx.addLine(to: screenPoints.last!)
+            ctx.addLine(to: stroke.points.last!)
         }
 
         ctx.strokePath()
+        ctx.restoreGState()
 
-        // Add texture effect for pencil and crayon (skip during gestures for performance)
-        if stroke.toolType.hasTexture && screenWidth > 2 && !isTwoFingerGesture {
-            drawTextureEffect(stroke: stroke, screenPoints: screenPoints, screenWidth: screenWidth, in: ctx)
+        // Texture effect (needs screen-space points, drawn without CTM)
+        if stroke.toolType.hasTexture && safeWidth > 2 && !isTwoFingerGesture {
+            let screenPoints = stroke.points.map { p -> CGPoint in
+                CGPoint(x: (CGFloat(Double(p.x)) + ox) * z + cx,
+                        y: (CGFloat(Double(p.y)) + oy) * z + cy)
+            }
+            drawTextureEffect(stroke: stroke, screenPoints: screenPoints, screenWidth: safeWidth, in: ctx)
         }
 
-        // Reset blend mode
+        // Reset blend mode (restoreGState already did, but be safe for cache context)
         ctx.setBlendMode(.normal)
     }
 
