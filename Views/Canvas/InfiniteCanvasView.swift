@@ -831,7 +831,11 @@ class InfiniteCanvasUIView: UIView {
 
         let screenWidth = CGFloat(Double(stroke.lineWidth) * viewModel.zoom)
         guard screenWidth > 0.01 && screenWidth.isFinite else { return }
-        let safeWidth = min(screenWidth, CGFloat(30000))
+        // Cap width high enough that the stroke naturally fills the viewport
+        // before the fill fast-path kicks in (smooth visual transition).
+        // At 2M with path coords ±1M, expanded raster coords ≈ ±2M which is
+        // well within Float32 precision (~0.24 px).
+        let safeWidth = min(screenWidth, CGFloat(2_000_000))
 
         // ── Compound offset (base-base + fine-fine) ──
         // Subtracting separately keeps all terms small and preserves
@@ -883,12 +887,14 @@ class InfiniteCanvasUIView: UIView {
 
         let n = stroke.points.count
 
-        // Fast path: when the stroke width alone fills the entire viewport,
-        // the visible result is just a solid color fill.  Check whether any
-        // segment's center-line passes within screenWidth/2 of the viewport
-        // center; if so the band covers the viewport entirely.
+        // Fast path: when the actual screen width exceeds the safeWidth cap,
+        // the path-based rendering can't represent the full width.  Check
+        // whether any segment's band (±screenWidth/2) covers the viewport
+        // center and fill if so.  Because safeWidth is large (2M), the stroke
+        // already naturally fills the viewport before this kicks in, so the
+        // visual transition is seamless.
         let viewDiag = hypot(Double(bounds.width), Double(bounds.height))
-        if Double(screenWidth) > viewDiag * 2 {
+        if screenWidth > safeWidth {
             let halfW = Double(screenWidth) / 2
             var bandHits = false
             for i in 1..<n {
@@ -929,9 +935,14 @@ class InfiniteCanvasUIView: UIView {
         }
 
         // Compute raw screen coordinates in Double (no clamping).
-        let clampRange: Double = 30000
-        let safeMinX = cx - clampRange, safeMaxX = cx + clampRange
-        let safeMinY = cy - clampRange, safeMaxY = cy + clampRange
+        // The Bezier-safe range stays tight (30000) for smooth curve precision.
+        // The Liang-Barsky clip rect expands by half the draw width so that
+        // segments whose band reaches the viewport are included.
+        let bezierRange: Double = 30000
+        let clipExpansion = min(Double(safeWidth) / 2, 1_000_000)
+        let clipRange = bezierRange + clipExpansion
+        let safeMinX = cx - clipRange, safeMaxX = cx + clipRange
+        let safeMinY = cy - clipRange, safeMaxY = cy + clipRange
 
         var rawSX = [Double](), rawSY = [Double]()
         rawSX.reserveCapacity(n); rawSY.reserveCapacity(n)
@@ -939,25 +950,27 @@ class InfiniteCanvasUIView: UIView {
         isNear.reserveCapacity(n)
         var allNear = true
 
+        let bezMinX = cx - bezierRange, bezMaxX = cx + bezierRange
+        let bezMinY = cy - bezierRange, bezMaxY = cy + bezierRange
         for p in stroke.points {
             let sx = (Double(p.x) + offsetX) * z + cx
             let sy = (Double(p.y) + offsetY) * z + cy
             rawSX.append(sx); rawSY.append(sy)
             let near = sx.isFinite && sy.isFinite &&
-                       sx >= safeMinX && sx <= safeMaxX &&
-                       sy >= safeMinY && sy <= safeMaxY
+                       sx >= bezMinX && sx <= bezMaxX &&
+                       sy >= bezMinY && sy <= bezMaxY
             isNear.append(near)
             if !near { allNear = false }
         }
 
-        // Clamped screen points for texture effect
+        // Clamped screen points for texture effect (use tight bezier range)
         let screenPoints: [CGPoint] = (0..<n).map { i in
             let sx = rawSX[i], sy = rawSY[i]
             guard sx.isFinite && sy.isFinite else { return CGPoint(x: cx, y: cy) }
             let ddx = sx - cx, ddy = sy - cy
             let ma = max(abs(ddx), abs(ddy))
-            if ma <= clampRange { return CGPoint(x: sx, y: sy) }
-            let s = clampRange / ma
+            if ma <= bezierRange { return CGPoint(x: sx, y: sy) }
+            let s = bezierRange / ma
             return CGPoint(x: cx + ddx * s, y: cy + ddy * s)
         }
 
