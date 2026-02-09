@@ -864,30 +864,123 @@ class InfiniteCanvasUIView: UIView {
         let sMaxY = CGFloat((lMaxY + offsetY) * z + cy)
         guard sMinX.isFinite && sMaxX.isFinite && sMinY.isFinite && sMaxY.isFinite else { return }
 
-        let margin = safeWidth + 50
-        let visibleBounds = bounds.insetBy(dx: -margin, dy: -margin)
-        let strokeBBox = CGRect(x: sMinX, y: sMinY, width: sMaxX - sMinX, height: sMaxY - sMinY)
+        // Use actual screen width (not capped) for the visibility margin.
+        // A stroke's band extends ±screenWidth/2 perpendicular to the
+        // center-line, so the center-line can be that far from the viewport
+        // and the stroke is still visible.
+        let visMargin = (screenWidth.isFinite ? min(screenWidth / 2, 1e10) : safeWidth) + 50
+        let visibleBounds = bounds.insetBy(dx: -visMargin, dy: -visMargin)
+        // Expand bbox by 1 so perfectly horizontal/vertical strokes aren't
+        // rejected as "empty" by CGRect.intersects.
+        let strokeBBox = CGRect(x: sMinX - 1, y: sMinY - 1,
+                                width: sMaxX - sMinX + 2, height: sMaxY - sMinY + 2)
         guard visibleBounds.intersects(strokeBBox) else { return }
 
         // ── Screen-space rendering ──
         // Convert local points to screen coords with Double math, then draw
         // at identity CTM.  This avoids CG's internal Float32 rasterizer
         // failing at extreme CTM scale (which causes strokes to vanish).
-        // Visible strokes always have pixel-range coords so Float32 is fine.
 
-        // Convert all points to screen space using Double precision.
-        // Clamp to ±30000 from screen center to keep coords in Float32-safe
-        // range for CG rasterizer.  Off-screen portions are invisible anyway,
-        // so clamping doesn't affect the visible result.
+        let n = stroke.points.count
+
+        // Fast path: when the stroke width alone fills the entire viewport,
+        // the visible result is just a solid color fill.  Check whether any
+        // segment's center-line passes within screenWidth/2 of the viewport
+        // center; if so the band covers the viewport entirely.
+        let viewDiag = hypot(Double(bounds.width), Double(bounds.height))
+        if Double(screenWidth) > viewDiag * 2 {
+            let halfW = Double(screenWidth) / 2
+            var bandHits = false
+            for i in 1..<n {
+                let ax = (Double(stroke.points[i-1].x) + offsetX) * z + cx
+                let ay = (Double(stroke.points[i-1].y) + offsetY) * z + cy
+                let bx = (Double(stroke.points[i].x) + offsetX) * z + cx
+                let by = (Double(stroke.points[i].y) + offsetY) * z + cy
+                guard ax.isFinite && ay.isFinite && bx.isFinite && by.isFinite else { continue }
+                // Distance from viewport center to nearest point on segment
+                let sdx = bx - ax, sdy = by - ay
+                let len2 = sdx * sdx + sdy * sdy
+                let dist: Double
+                if len2 < 1e-20 {
+                    dist = hypot(ax - cx, ay - cy)
+                } else {
+                    let t = max(0, min(1, ((cx - ax) * sdx + (cy - ay) * sdy) / len2))
+                    dist = hypot(ax + t * sdx - cx, ay + t * sdy - cy)
+                }
+                if dist < halfW { bandHits = true; break }
+            }
+            if bandHits {
+                ctx.saveGState()
+                if stroke.isEraser {
+                    ctx.setBlendMode(.clear)
+                    ctx.setFillColor(UIColor.white.cgColor)
+                } else {
+                    ctx.setBlendMode(.normal)
+                    ctx.setFillColor(red: stroke.red, green: stroke.green,
+                                     blue: stroke.blue, alpha: stroke.alpha * stroke.opacity)
+                }
+                ctx.fill(bounds)
+                ctx.restoreGState()
+                ctx.setBlendMode(.normal)
+                return
+            }
+            // Band doesn't actually reach the viewport — skip this stroke
+            return
+        }
+
+        // Compute raw screen coordinates in Double (no clamping).
         let clampRange: Double = 30000
-        let clampMinX = cx - clampRange, clampMaxX = cx + clampRange
-        let clampMinY = cy - clampRange, clampMaxY = cy + clampRange
-        let screenPoints = stroke.points.map { p -> CGPoint in
+        let safeMinX = cx - clampRange, safeMaxX = cx + clampRange
+        let safeMinY = cy - clampRange, safeMaxY = cy + clampRange
+
+        var rawSX = [Double](), rawSY = [Double]()
+        rawSX.reserveCapacity(n); rawSY.reserveCapacity(n)
+        var isNear = [Bool]()
+        isNear.reserveCapacity(n)
+        var allNear = true
+
+        for p in stroke.points {
             let sx = (Double(p.x) + offsetX) * z + cx
             let sy = (Double(p.y) + offsetY) * z + cy
+            rawSX.append(sx); rawSY.append(sy)
+            let near = sx.isFinite && sy.isFinite &&
+                       sx >= safeMinX && sx <= safeMaxX &&
+                       sy >= safeMinY && sy <= safeMaxY
+            isNear.append(near)
+            if !near { allNear = false }
+        }
+
+        // Clamped screen points for texture effect
+        let screenPoints: [CGPoint] = (0..<n).map { i in
+            let sx = rawSX[i], sy = rawSY[i]
             guard sx.isFinite && sy.isFinite else { return CGPoint(x: cx, y: cy) }
-            return CGPoint(x: min(clampMaxX, max(clampMinX, sx)),
-                           y: min(clampMaxY, max(clampMinY, sy)))
+            let ddx = sx - cx, ddy = sy - cy
+            let ma = max(abs(ddx), abs(ddy))
+            if ma <= clampRange { return CGPoint(x: sx, y: sy) }
+            let s = clampRange / ma
+            return CGPoint(x: cx + ddx * s, y: cy + ddy * s)
+        }
+
+        // Liang-Barsky line segment clipping to safe rect.
+        // Returns clipped endpoints, or nil if fully outside.
+        func clipSeg(_ x1: Double, _ y1: Double,
+                     _ x2: Double, _ y2: Double) -> (CGPoint, CGPoint)? {
+            let sdx = x2 - x1, sdy = y2 - y1
+            var tMin: Double = 0, tMax: Double = 1
+            let ps = [-sdx, sdx, -sdy, sdy]
+            let qs = [x1 - safeMinX, safeMaxX - x1, y1 - safeMinY, safeMaxY - y1]
+            for j in 0..<4 {
+                if abs(ps[j]) < 1e-300 {
+                    if qs[j] < 0 { return nil }
+                } else {
+                    let t = qs[j] / ps[j]
+                    if ps[j] < 0 { tMin = max(tMin, t) }
+                    else { tMax = min(tMax, t) }
+                }
+            }
+            guard tMin <= tMax else { return nil }
+            return (CGPoint(x: x1 + tMin * sdx, y: y1 + tMin * sdy),
+                    CGPoint(x: x1 + tMax * sdx, y: y1 + tMax * sdy))
         }
 
         ctx.saveGState()
@@ -901,7 +994,6 @@ class InfiniteCanvasUIView: UIView {
             ctx.setStrokeColor(red: stroke.red, green: stroke.green, blue: stroke.blue, alpha: stroke.alpha * stroke.opacity)
         }
 
-        // Line width in screen pixels (already capped by safeWidth)
         ctx.setLineWidth(safeWidth)
         ctx.setLineCap(stroke.toolType.lineCap)
         ctx.setLineJoin(stroke.toolType.lineJoin)
@@ -913,24 +1005,65 @@ class InfiniteCanvasUIView: UIView {
             ctx.setLineDash(phase: 0, lengths: [])
         }
 
-        // Build path in screen coordinates (pixel-range — Float32 safe)
+        // Build path.  When all points are in Float32-safe range, use smooth
+        // Bezier curves.  Otherwise use Bezier for consecutive near-near
+        // segments and Liang-Barsky clipped lines for far segments.
         ctx.beginPath()
-        ctx.move(to: screenPoints[0])
 
-        if stroke.toolType == .ruler || screenPoints.count == 2 {
-            ctx.addLine(to: screenPoints.last!)
+        if allNear {
+            // All points in safe range — original smooth Bezier path
+            ctx.move(to: screenPoints[0])
+            if stroke.toolType == .ruler || n == 2 {
+                ctx.addLine(to: screenPoints[n - 1])
+            } else {
+                for i in 1..<n {
+                    let p0 = screenPoints[i - 1]
+                    let p1 = screenPoints[i]
+                    let mid = CGPoint(x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2)
+                    if i == 1 { ctx.addLine(to: mid) }
+                    else { ctx.addQuadCurve(to: mid, control: p0) }
+                }
+                ctx.addLine(to: screenPoints[n - 1])
+            }
+        } else if stroke.toolType == .ruler || n == 2 {
+            // 2-point stroke — clip the single segment
+            if let (a, b) = clipSeg(rawSX[0], rawSY[0], rawSX[n-1], rawSY[n-1]) {
+                ctx.move(to: a); ctx.addLine(to: b)
+            }
         } else {
-            for i in 1..<screenPoints.count {
-                let p0 = screenPoints[i - 1]
-                let p1 = screenPoints[i]
-                let mid = CGPoint(x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2)
-                if i == 1 {
-                    ctx.addLine(to: mid)
+            // Hybrid: Bezier for near-near, clipped lines for the rest.
+            var inBezier = false
+
+            for i in 1..<n {
+                if isNear[i - 1] && isNear[i] {
+                    // Both near — smooth Bezier
+                    let p0 = CGPoint(x: rawSX[i-1], y: rawSY[i-1])
+                    let p1 = CGPoint(x: rawSX[i], y: rawSY[i])
+                    let mid = CGPoint(x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2)
+                    if !inBezier {
+                        ctx.move(to: p0)
+                        ctx.addLine(to: mid)
+                        inBezier = true
+                    } else {
+                        ctx.addQuadCurve(to: mid, control: p0)
+                    }
                 } else {
-                    ctx.addQuadCurve(to: mid, control: p0)
+                    if inBezier {
+                        ctx.addLine(to: CGPoint(x: rawSX[i-1], y: rawSY[i-1]))
+                        inBezier = false
+                    }
+                    guard rawSX[i-1].isFinite && rawSY[i-1].isFinite &&
+                          rawSX[i].isFinite && rawSY[i].isFinite else { continue }
+                    if let (a, b) = clipSeg(rawSX[i-1], rawSY[i-1], rawSX[i], rawSY[i]) {
+                        ctx.move(to: a)
+                        ctx.addLine(to: b)
+                    }
                 }
             }
-            ctx.addLine(to: screenPoints.last!)
+
+            if inBezier {
+                ctx.addLine(to: CGPoint(x: rawSX[n-1], y: rawSY[n-1]))
+            }
         }
 
         ctx.strokePath()
